@@ -1,0 +1,438 @@
+import re
+import shutil
+import threading
+from pathlib import Path
+from typing import Dict, List
+
+import torch
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
+
+app = FastAPI(
+    title="Legal RAG Chatbot",
+    description="Question Answering & Summarization on Legal Documents",
+    version="1.1.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+UPLOAD_DIR = DATA_DIR / "uploads"
+CONSTITUTION_PDF = DATA_DIR / "constitution.pdf"
+
+MAX_SESSION_BYTES = 10 * 1024 * 1024   # 10 MB
+MAX_TOTAL_BYTES = 50 * 1024 * 1024     # 50 MB
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+history_lock = threading.Lock()
+index_lock = threading.Lock()
+
+# Session histories and uploaded document metadata are held in memory.
+# Uploaded PDF files themselves are stored on disk.
+chat_histories: Dict[str, list] = {}
+uploaded_documents: Dict[str, dict] = {}
+
+
+# --------------------------------------------------
+# REQUEST MODELS
+# --------------------------------------------------
+
+class Question(BaseModel):
+    query: str
+    session_id: str = "default"
+
+
+# --------------------------------------------------
+# HELPERS
+# --------------------------------------------------
+
+def clean_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def safe_session_id(session_id: str) -> str:
+    """Restrict session IDs to safe directory-name characters."""
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]", "_", session_id or "default")
+    return cleaned[:100] or "default"
+
+
+def session_upload_dir(session_id: str) -> Path:
+    folder = UPLOAD_DIR / safe_session_id(session_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def get_uploaded_files() -> List[Path]:
+    return sorted(UPLOAD_DIR.glob("*/*.pdf"))
+
+
+def get_total_upload_bytes() -> int:
+    return sum(path.stat().st_size for path in get_uploaded_files())
+
+
+def get_session_upload_bytes(session_id: str) -> int:
+    folder = session_upload_dir(session_id)
+    return sum(
+        path.stat().st_size
+        for path in folder.glob("*.pdf")
+        if path.is_file()
+    )
+
+
+def document_record(path: Path) -> dict:
+    try:
+        relative_path = path.relative_to(UPLOAD_DIR)
+        session_id = relative_path.parts[0]
+    except (ValueError, IndexError):
+        session_id = "default"
+
+    return {
+        "name": path.name,
+        "filename": path.name,
+        "session_id": session_id,
+        "size": path.stat().st_size,
+        "size_bytes": path.stat().st_size,
+    }
+
+
+def load_pdf_documents(path: Path):
+    """Load a PDF and attach its source filename to each page."""
+    pages = PyPDFLoader(str(path)).load()
+    for page in pages:
+        page.metadata["source"] = path.name
+    return pages
+
+
+# --------------------------------------------------
+# LOAD EMBEDDINGS, DOCUMENTS AND LANGUAGE MODEL
+# --------------------------------------------------
+
+if not CONSTITUTION_PDF.exists():
+    raise FileNotFoundError(
+        f"Constitution PDF not found: {CONSTITUTION_PDF}. "
+        "Place constitution.pdf inside backend/data/."
+    )
+
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=800,
+    chunk_overlap=150,
+)
+
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+model_name = "facebook/bart-large-cnn"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+model.eval()
+
+
+def rebuild_vectorstore():
+    """Index the Constitution and all saved uploaded PDFs."""
+    global vectorstore
+
+    all_pages = load_pdf_documents(CONSTITUTION_PDF)
+
+    for pdf_path in get_uploaded_files():
+        try:
+            all_pages.extend(load_pdf_documents(pdf_path))
+        except Exception as exc:
+            print(f"Skipping unreadable PDF {pdf_path.name}: {exc}")
+
+    chunks = text_splitter.split_documents(all_pages)
+
+    if not chunks:
+        raise RuntimeError("No readable text was found in the PDF files.")
+
+    vectorstore = FAISS.from_documents(chunks, embeddings)
+    print(f"Indexed {len(chunks)} text chunks.")
+
+
+# Create the initial searchable index.
+rebuild_vectorstore()
+
+
+# Rebuild document metadata from files already on disk.
+for existing_pdf in get_uploaded_files():
+    try:
+        record = document_record(existing_pdf)
+        uploaded_documents[
+            f"{record['session_id']}/{record['name']}"
+        ] = record
+    except OSError:
+        pass
+
+
+# --------------------------------------------------
+# ROOT / HEALTH CHECK
+# --------------------------------------------------
+
+@app.get("/")
+def root():
+    return {
+        "status": "Legal RAG API is running",
+        "docs": "/docs",
+    }
+
+
+@app.get("/health")
+@app.get("/app")
+def health():
+    # Return a clear online status for frontend health checks.
+    return {"status": "online", "ok": True}
+
+
+# --------------------------------------------------
+# DOCUMENT LIBRARY
+# --------------------------------------------------
+
+@app.get("/documents")
+def get_documents(session_id: str = "default"):
+    """List uploaded PDFs for this session and report storage usage."""
+    session_id = safe_session_id(session_id)
+    folder = session_upload_dir(session_id)
+
+    files = sorted(path for path in folder.glob("*.pdf") if path.is_file())
+    records = [document_record(path) for path in files]
+
+    return {
+        "documents": records,
+        "session_bytes": sum(item["size"] for item in records),
+        "max_session_bytes": MAX_SESSION_BYTES,
+        "total_bytes": get_total_upload_bytes(),
+        "max_total_bytes": MAX_TOTAL_BYTES,
+    }
+
+
+@app.post("/documents")
+async def upload_document(
+    file: UploadFile = File(...),
+    session_id: str = "default",
+):
+    """Upload, save and index a PDF document."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Choose a PDF file.")
+
+    if Path(file.filename).suffix.lower() != ".pdf":
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF files are supported.",
+        )
+
+    session_id = safe_session_id(session_id)
+    folder = session_upload_dir(session_id)
+
+    # Use a unique stored filename to avoid overwriting existing files.
+    safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", Path(file.filename).name)
+    if not safe_name.lower().endswith(".pdf"):
+        safe_name += ".pdf"
+
+    contents = await file.read()
+    await file.close()
+
+    if not contents:
+        raise HTTPException(status_code=400, detail="The PDF is empty.")
+
+    if len(contents) > MAX_SESSION_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="The file exceeds the 10 MB session limit.",
+        )
+
+    if not contents.startswith(b"%PDF-"):
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file does not appear to be a valid PDF.",
+        )
+
+    if get_session_upload_bytes(session_id) + len(contents) > MAX_SESSION_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="The 10 MB session storage limit would be exceeded.",
+        )
+
+    if get_total_upload_bytes() + len(contents) > MAX_TOTAL_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="The 50 MB total upload storage limit would be exceeded.",
+        )
+
+    destination = folder / safe_name
+    suffix = 1
+    while destination.exists():
+        destination = folder / f"{Path(safe_name).stem}_{suffix}.pdf"
+        suffix += 1
+
+    try:
+        destination.write_bytes(contents)
+
+        # Validate readability before rebuilding the index.
+        pages = load_pdf_documents(destination)
+        if not any(page.page_content.strip() for page in pages):
+            raise ValueError("No readable text found in this PDF.")
+
+        with index_lock:
+            rebuild_vectorstore()
+
+        record = document_record(destination)
+        uploaded_documents[
+            f"{session_id}/{destination.name}"
+        ] = record
+
+        return {
+            "message": "Document uploaded and indexed successfully.",
+            "document": record,
+        }
+
+    except Exception as exc:
+        if destination.exists():
+            destination.unlink()
+
+        # Restore the index after a failed upload.
+        with index_lock:
+            rebuild_vectorstore()
+
+        if isinstance(exc, HTTPException):
+            raise exc
+
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not process this PDF: {exc}",
+        ) from exc
+
+
+# --------------------------------------------------
+# CHAT HISTORY
+# --------------------------------------------------
+
+@app.get("/history")
+def get_history(session_id: str = "default"):
+    session_id = safe_session_id(session_id)
+
+    with history_lock:
+        messages = list(chat_histories.get(session_id, []))
+
+    return {"messages": messages}
+
+
+@app.delete("/history")
+def clear_history(session_id: str = "default"):
+    session_id = safe_session_id(session_id)
+
+    with history_lock:
+        chat_histories[session_id] = []
+
+    return {"message": "Chat history cleared."}
+
+
+# --------------------------------------------------
+# LEGAL QUESTION ANSWERING
+# --------------------------------------------------
+
+@app.post("/ask")
+def ask(question: Question):
+    query = question.query.strip()
+
+    if not query:
+        raise HTTPException(
+            status_code=400,
+            detail="Query cannot be empty.",
+        )
+
+    session_id = safe_session_id(question.session_id)
+
+    try:
+        with index_lock:
+            docs = vectorstore.similarity_search(query, k=3)
+
+        if not docs:
+            answer = "No relevant provisions were found in the indexed documents."
+            sources = []
+        else:
+            combined_text = clean_text(
+                " ".join(doc.page_content for doc in docs)
+            )
+
+            # BART is a summarization model. Summarize retrieved passages.
+            inputs = tokenizer(
+                combined_text,
+                max_length=1024,
+                truncation=True,
+                return_tensors="pt",
+            )
+
+            with torch.inference_mode():
+                summary_ids = model.generate(
+                    inputs["input_ids"],
+                    attention_mask=inputs.get("attention_mask"),
+                    num_beams=4,
+                    max_new_tokens=120,
+                    early_stopping=True,
+                )
+
+            answer = tokenizer.decode(
+                summary_ids[0],
+                skip_special_tokens=True,
+            ).strip()
+
+            sources = []
+            for doc in docs:
+                source_name = doc.metadata.get("source", "Unknown")
+                page_number = doc.metadata.get("page")
+                source = {"document": source_name}
+                if page_number is not None:
+                    source["page"] = page_number + 1
+                if source not in sources:
+                    sources.append(source)
+
+            if not answer:
+                answer = (
+                    "Relevant passages were found, but a summary "
+                    "could not be generated."
+                )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process the legal query: {exc}",
+        ) from exc
+
+    with history_lock:
+        history = chat_histories.setdefault(session_id, [])
+        history.extend([
+            {"role": "user", "content": query},
+            {"role": "assistant", "content": answer},
+        ])
+
+    return {
+        "question": query,
+        "answer": answer,
+        "summary": answer,
+        "sources": sources,
+        "disclaimer": (
+            "Educational and research purposes only. "
+            "Verify legal information against current official sources. "
+            "This is not legal advice."
+        ),
+    }
