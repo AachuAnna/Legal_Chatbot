@@ -159,6 +159,4 @@ Potential improvements include:
 
 **Repository:** [GitHub — Chatbot](https://github.com/alanabrahambinu/chatbot)
 
-## 📄 License
 
-Refer to the repository's existing license file, if available, for information about permitted use, modification, and distribution.
